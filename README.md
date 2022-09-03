@@ -95,7 +95,8 @@ python run_celeba_hq.py --resume_ckpt_path '<CHECKPOINT_PATH>' --resume True
 
 ### 3.3 DDIM
 
-`note`: you need to convert the weights first (see 2.1)
+`note`: you need to convert the weights if you want to use the checkpoints (see 2.1)
+
 
 - CIFAR10
 
