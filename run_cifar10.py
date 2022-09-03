@@ -1,0 +1,234 @@
+import os
+import paddle
+import paddle.nn as nn
+import paddle.optimizer
+import numpy as np
+from PIL import Image
+import paddle.io
+from paddle.vision.datasets import Cifar10
+import paddle.vision.transforms as transforms
+from tqdm import trange
+from visualdl import LogWriter
+import argparse
+
+from models.diffusion import DiffusionModel
+from models.unet import UNet
+from utils.utils import make_grid, build_infinite_sampler
+
+
+def build_cifar10_dataloader(path: str, batchsize: int, num_workers: int=8):
+    dataset = Cifar10(
+        data_file=path, mode='train', 
+        transform=transforms.Compose([
+            transforms.RandomHorizontalFlip(), 
+            transforms.ToTensor()]))
+    return paddle.io.DataLoader(dataset=dataset, batch_size=batchsize, shuffle=True, drop_last=True, num_workers=num_workers)
+
+def build_lr_scheduler(lr, warmup_steps):
+    def warm_up(step):
+        return min(step, warmup_steps) / warmup_steps
+    lr_sch = paddle.optimizer.lr.LambdaDecay(lr, warm_up)
+    return lr_sch
+
+class _DiffusionModel(DiffusionModel):
+    def __init__(self, denoise_model, options: dict, betas=None, ema_model=None):
+        super().__init__(denoise_model, options, betas, ema_model)
+
+    def train(self, sampler, ckpt=None):
+        # Step 1. build grad clipper and optimizer
+        clip = nn.ClipGradByNorm(clip_norm=1.0)
+        lr_sched = build_lr_scheduler(self.options['lr'], self.options['warmup_steps'])
+        if ckpt is not None:
+            lr_sched.set_state_dict(ckpt['lr_sched'])
+        optimizer = paddle.optimizer.Adam(parameters=self.denoise_model.parameters(), learning_rate=lr_sched, grad_clip=clip)
+        if ckpt is not None:
+            optimizer.set_state_dict(ckpt['optim'])
+
+        logwriter = LogWriter(self.options['log_dir'])
+
+        # Step 2. training loop
+        self.denoise_model.train()
+        pbar = trange(0 if ckpt is None else ckpt['ckpt_idx']+1, self.options['training_iters'], dynamic_ncols=True)
+        for step_idx in pbar:
+            batch_x = next(sampler)
+            # Step 3. sample t
+            t = paddle.randint(0, self.num_steps, shape=(self.options['batchsize'],))
+            # Step 4. calculate loss and optimize model
+            loss = self.deffusion_loss(batch_x, t)
+            optimizer.clear_grad()
+            loss.backward()
+            optimizer.step()
+            lr_sched.step()
+
+            # Step 5. update ema
+            self.update_ema()
+            pbar.set_postfix(loss='%.4f' % loss.numpy()[0])
+            logwriter.add_scalar("loss", loss.numpy()[0], step_idx+1)
+            
+            # Step 6. sample results
+            if (step_idx+1) % self.options['sample_interval'] == 0:
+                self.denoise_model.eval()
+                _img = self.sample_image(self.options['sample_dir'], "iter{}".format(step_idx+1), 64, 64, 8, 8)
+                logwriter.add_image("sample", np.array(_img), step_idx+1)
+                self.denoise_model.train()
+
+            # Step 7. save checkpoints
+            if (step_idx+1) % self.options['ckpt_interval'] == 0:
+                paddle.save({
+                    'model': self.denoise_model.state_dict(),
+                    'model_ema': self.ema_model.state_dict(),
+                    'lr_sched': lr_sched.state_dict(),
+                    'optim': optimizer.state_dict(),
+                    'options': self.options,
+                    'betas': self.betas.numpy(),
+                    'ckpt_idx': step_idx
+                }, os.path.join(self.options['ckpt_dir'], "cifar10_ckpt_iter_{}.pdparam".format(step_idx+1)))
+
+    def sample_image(self, path, postfix, n_samples=1, batch_size=1, nrow=1, ncol=1, enable_pbar=False):
+        if batch_size == 1:
+            img = self.p_sample_loop((1, 3, 32, 32), enable_pbar)
+            img = paddle.clip(img, 0, 1).reshape((3, 32, 32)).transpose((1, 2, 0)) * 255
+            _img = Image.fromarray(np.uint8(img.numpy()))
+            _img.save(os.path.join(path, "sample_{}.png".format(postfix)))
+        else:
+            if n_samples <= batch_size:
+                imgs = self.p_sample_loop((n_samples, 3, 32, 32), enable_pbar)
+            else:
+                n_steps = n_samples//batch_size
+                remain = n_samples - n_steps * batch_size
+                imgs = []
+                for i in range(n_steps):
+                    print("Step {} ...".format(i+1))
+                    imgs.append(self.p_sample_loop((batch_size, 3, 32, 32), enable_pbar))
+                if remain != 0:
+                    print("Step {} ...".format(n_steps+1))
+                    imgs.append(self.p_sample_loop((remain, 3, 32, 32), enable_pbar))
+                imgs = paddle.concat(imgs, axis=0)
+            imgs = paddle.clip(imgs, 0, 1).transpose((0, 2, 3, 1)) * 255
+            image = make_grid(imgs, nrow, ncol, 2, 2)
+            _img = Image.fromarray(np.uint8(image.numpy()))
+            _img.save(os.path.join(path, "sample_{}.png".format(postfix)))    
+        return _img    
+
+    def sample_sequence(self, path, postfix, n_samples=1, interval=1, enable_pbar=False):
+        # n_samples == batch_size !!!
+        _, x0_preds = self.p_sample_loop((n_samples, 3, 32, 32), enable_pbar, track_x0pred=True)
+        assert len(x0_preds) % interval == 0
+        # b * (n_steps/interval) * h * w * c
+        seq_imgs = paddle.concat([im.transpose((0, 2, 3, 1)).unsqueeze(1) for im in x0_preds[::interval]], axis=1)  
+        seq_imgs = paddle.clip(seq_imgs, 0, 1).reshape((-1, 32, 32, 3)) * 255
+        image = make_grid(seq_imgs, n_samples, self.num_steps//interval, 2, 2)
+        _img = Image.fromarray(np.uint8(image.numpy()))
+        _img.save(os.path.join(path, "sample_{}.png".format(postfix)))    
+        return _img   
+
+def resume_training_from_ckpt(path, sampler):
+    ckpt = paddle.load(path)
+    d_m = UNet(
+        num_steps=ckpt['options']['num_diffusion_steps'],
+        ch=128, ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_levels=[1], dropout=0.1
+    )
+    d_m.set_state_dict(ckpt['model'])
+    ema_m = UNet(
+        num_steps=ckpt['options']['num_diffusion_steps'],
+        ch=128, ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_levels=[1], dropout=0.1
+    )
+    ema_m.set_state_dict(ckpt['model_ema'])
+    ddpm = _DiffusionModel(d_m, ckpt['options'], ckpt['betas'], ema_m)
+    ddpm.train(sampler, ckpt)
+    return ddpm
+
+def save_model_from_ckpt(src_path, dest_path, use_ema=True):
+    ckpt = paddle.load(src_path)
+    paddle.save(
+        {
+            'betas': ckpt['betas'], 
+            'model': ckpt['model_ema'] if use_ema else ckpt['model'],
+            'options': ckpt['options']},
+        dest_path
+    )
+
+def build_from_pretrained(path):
+    state_dict = paddle.load(path)
+    ddpm = _DiffusionModel(
+        UNet(
+                num_steps=state_dict['options']['num_diffusion_steps'],
+                ch=128, ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_levels=[1], dropout=0.1
+            ), 
+        state_dict['options'],
+        state_dict['betas'])
+    ddpm.load_denoising_model_ckpt(state_dict['model'])
+    return ddpm
+
+if  __name__ == "__main__":
+    # options
+    options = {
+        'beta_schedule': 'linear',
+        'beta_start': 0.0001,
+        'beta_end': 0.02,
+        'num_diffusion_steps': 1000,
+        'loss_type': 'noisepred',
+        'batchsize': 128,
+        'training_iters': 800000,
+        'num_workers': 8,
+        'ema_decay': 0.995,
+        'lr': 2e-4,
+        'warmup_steps': 5000,
+        'sample_interval': 5000,
+        'ckpt_interval': 40000,
+        'ckpt_dir': "./ckpts",
+        'sample_dir': "./sample",
+        'log_dir': "./log",
+        'pretrained_path': "./ckpts/ddpm_cifar10_i800000_ema.pdparam",
+        'resume_ckpt_path': "./ckpts/cifar10_ckpt_iter_40000.pdparam",
+        'resume': False,
+        'mode': 'train',  # 'denoise': generate, 'convert': convert ckpt for training to ckpt for denosing, 'train': train model
+        'num_images': '64-8-8',  # 64 images with 8 rows and 8 cols
+        'sequence': False,  
+        'sample_postfix': "ddpm_cifar10_test"
+    }
+
+    parser = argparse.ArgumentParser()
+    for k, val in options.items():
+        parser.add_argument("--"+k, type=type(val), default=val)
+
+    _options = vars(parser.parse_args())
+    for k, val in _options.items():
+        options[k] = val
+
+    if options['mode'] == 'train':
+        # train
+        dataloader = build_cifar10_dataloader(None, options['batchsize'], options['num_workers'])
+        sampler = build_infinite_sampler(dataloader)
+
+        if not options['resume']:
+            ddpm = _DiffusionModel(denoise_model=UNet(
+                num_steps=options['num_diffusion_steps'],
+                ch=128, ch_mult=(1, 2, 2, 2), num_res_blocks=2, attn_levels=[1], dropout=0.1
+            ), options=options)
+            ddpm.train(sampler=sampler)
+        else:
+            print("Resume Training")
+            ddpm = resume_training_from_ckpt(options['resume_ckpt_path'], sampler)
+
+        ddpm.save_state_dict(
+            "{}/ddpm_cifar10_i{}_ema.pdparam".format(options['ckpt_dir'], options['training_iters']))
+        ddpm.save_state_dict(
+            "{}/ddpm_cifar10_i{}.pdparam".format(options['ckpt_dir'], options['training_iters']), save_ema=False)
+    elif options['mode'] == 'convert':
+        # convert
+        save_model_from_ckpt(options["resume_ckpt_path"], options['pretrained_path'])
+    else:
+        # denoise
+        ddpm = build_from_pretrained(options['pretrained_path'])
+        ddpm.denoise_model.eval()
+        n_im, n_row, n_col = tuple([int(i) for i in options['num_images'].split("-")])
+        if not options['sequence']:
+            _img = ddpm.sample_image(
+                options['sample_dir'], options['sample_postfix'], 
+                n_im, n_im if n_im<=options['batchsize'] else options['batchsize'], n_row, n_col, True)
+        else:
+            _img = ddpm.sample_sequence(
+                options['sample_dir'], options['sample_postfix'], 
+                n_im, 50, True
+            )
