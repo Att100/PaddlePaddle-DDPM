@@ -25,7 +25,7 @@ This is a PaddlePaddle reproduction of Denoising Diffusion Probabilistic Models 
 
 - CIFAR10
 
-- CelebA-HQ
+- CelebA-HQ (please download and place it in datasets folder)
 
 ### 2.2 Train from scratch
 
