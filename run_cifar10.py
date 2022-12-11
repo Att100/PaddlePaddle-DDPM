@@ -54,7 +54,7 @@ class _DiffusionModel(DiffusionModel):
             # Step 3. sample t
             t = paddle.randint(0, self.num_steps, shape=(self.options['batchsize'],))
             # Step 4. calculate loss and optimize model
-            loss = self.deffusion_loss(batch_x, t)
+            loss = self.diffusion_loss(batch_x, t)
             optimizer.clear_grad()
             loss.backward()
             optimizer.step()

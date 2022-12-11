@@ -123,7 +123,7 @@ class DiffusionModel:
                 x_start.shape[0])
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def deffusion_loss(self, x_start, t, noise=None):
+    def diffusion_loss(self, x_start, t, noise=None):
         if noise is None:
             noise = paddle.randn(shape=x_start.shape)
         assert noise.shape == x_start.shape
